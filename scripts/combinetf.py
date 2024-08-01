@@ -89,6 +89,10 @@ parser.add_option("","--externalCovariance", default=False, action='store_true',
 parser.add_option("","--doJacobian", default = False, action='store_true', help="Compute and store Jacobian of expected event counts with respect to fit parameters")
 parser.add_option("","--skipNullExpBins", default = False, action='store_true', help="skip bins with zero expected events in likelihood")
 parser.add_option("","--globalImpacts", default = False, action='store_true', help="compute impacts in terms of variations of global observables (as opposed to nuisance parameters directly)")
+parser.add_option("","--scaleBinByBinStat", default=-1., type=float, help="scale bin by bin stat")
+parser.add_option("","--unblind", default=False, action="store_true", help="unblind mass values")
+parser.add_option("","--yes-i-really-really-mean-it", default=False, action="store_true", help="really unblind mass values")
+
 (options, args) = parser.parse_args()
 
 if len(args) == 0:
@@ -148,8 +152,11 @@ poly2dreggroupfullorder = f['hpoly2dreggroupfullorder'][...]
 poly2dreggroupnames = f['hpoly2dreggroupnames'][...]
 poly2dreggroupbincenters0 = f['hpoly2dreggroupbincenters0'][...]
 poly2dreggroupbincenters1 = f['hpoly2dreggroupbincenters1'][...]
+
 noigroups = f['hnoigroups'][...]
 noigroupidxs = f['hnoigroupidxs'][...]
+if "hmaskednoigroupidxs" in f.keys():
+  maskednoigroupidxs = f['hmaskednoigroupidxs'][...]
 maskedchans = f['hmaskedchans'][...]
 if "hpseudodatanames" in f.keys():
   pseudodatanames = f['hpseudodatanames'][...]
@@ -272,6 +279,7 @@ if options.externalCovariance:
 if options.binByBinStat:
   hkstat = f['hkstat']
   kstat = maketensor(hkstat)
+  kstat = kstat/options.scaleBinByBinStat**2
 if sparse:
   norm_sparse = makesparsetensor(hnorm_sparse)
   logk_sparse = makesparsetensor(hlogk_sparse)
@@ -325,16 +333,20 @@ x = tf.Variable(xdefault, name="x")
 xpoi = x[:npoi]
 theta = x[npoi:]
 
-if False:
+if options.unblind and not options.yes_i_really_really_mean_it:
+  raise RuntimeError("to unblind add --yes-i-really-really-mean-it")
+
+if options.toys == 0 and options.pseudodata is None and not options.unblind:
   # hardcoded random blinding for now
   thetarng = np.zeros((nsyst,), dtype=np.float64)
 
-  if options.toys == 0 and options.pseudodata is None:
-    np.random.seed()
-    for isyst, syst in enumerate(systs):
-      if "mass" in syst.lower():
-        print("blinding syst:", syst)
-        thetarng[isyst] = np.random.normal(loc=0., scale=50.)
+  np.random.seed()
+  offset = np.random.normal(loc=0., scale=50.)
+  for isyst, syst in enumerate(systs):
+
+    if syst.startswith("massShift"):
+      print("blinding syst:", syst)
+      thetarng[isyst] = offset
 
   thetarng = tf.constant(thetarng, dtype=dtype)
 
@@ -427,8 +439,11 @@ else:
   
   if options.saveHists:
     normfullcentral = ernorm*snormnorm
-    
-pmaskedexp = rnorm*tf.reduce_sum(snormnormmasked,axis=0)
+  
+if len(signals):
+  pmaskedexp = rnorm*tf.reduce_sum(snormnormmasked,axis=0)
+else:
+  pmaskedexp = tf.reduce_sum(snormnormmasked,axis=1)
 
 maskedexp = nexpfullcentral[nbins:]
 
@@ -460,7 +475,7 @@ if options.binByBinStat:
   if options.correlateXsecStat:
     #partially propagate statistical fluctuations on expected values to yields in
     #masked channels, based on the fraction of overlapping events
-        
+    
     sumnormmasked = tf.reduce_sum(normmasked,axis=0)
     
     logbeta = tf.log(beta)
@@ -494,16 +509,25 @@ else:
   if options.saveHists:
     normfull = normfullcentral
 
-#matrix multiplication below is equivalent to
-#pmaskedexpnorm = r*tf.reduce_sum(snormnormmasked/maskedexp, axis=0)
+if nbinsmasked>0 and nnoigroups > 0 and nsignals > 0:
+  print("Masked channels doesn't work for poi (signals) and nois at the same time, pois will be used only")
 
-mmaskedexpr = tf.expand_dims(tf.reciprocal(maskedexp),0)
-pmaskedexpnorm = tf.matmul(mmaskedexpr,snormnormmasked)
-pmaskedexpnorm = tf.squeeze(pmaskedexpnorm,0)
-pmaskedexpnorm = rnorm*pmaskedexpnorm
+if nsignals > 0:
+  #matrix multiplication below is equivalent to
+  #pmaskedexpnorm = r*tf.reduce_sum(snormnormmasked/maskedexp, axis=0)
+  mmaskedexpr = tf.expand_dims(tf.reciprocal(maskedexp),0)
+  pmaskedexpnorm = tf.matmul(mmaskedexpr,snormnormmasked)
+  pmaskedexpnorm = tf.squeeze(pmaskedexpnorm,0)
+  pmaskedexpnorm = rnorm*pmaskedexpnorm
 
-pmaskedexpsig = pmaskedexp[:nsignals]
-pmaskedexpnormsig = pmaskedexpnorm[:nsignals]
+  pmaskedexpsig = pmaskedexp[:nsignals]
+  pmaskedexpnormsig = pmaskedexpnorm[:nsignals]
+else:
+  pmaskedexp = pmaskedexp
+  pmaskedexpnorm = pmaskedexp*tf.reciprocal(tf.reduce_sum(maskedexp))
+
+  pmaskedexpsig = pmaskedexp
+  pmaskedexpnormsig = pmaskedexpnorm
 
 if options.saveHists:
   nexpsigcentral = tf.reduce_sum(normfullcentral[:,:nsignals],axis=-1)
@@ -574,7 +598,7 @@ if options.binByBinStat:
 poi = tf.identity(poi, name=options.POIMode)
 pmaskedexpsig = tf.identity(pmaskedexpsig, "pmaskedexp")
 pmaskedexpnormsig = tf.identity(pmaskedexpnormsig, "pmaskedexpnorm")
- 
+
 outputs = []
 outputnames = []
 
@@ -592,19 +616,37 @@ if options.doRegularization:
   
 if options.POIMode == "mu":  
   if nbinsmasked>0:
-    outputs.append(pmaskedexpsig)
-    outputs.append(pmaskedexpnormsig)
-    
-    outputname = []
-    for signal in signals:
-      outputname.append("%s_pmaskedexp" % signal)
-    outputnames.append(outputname)
 
-    outputname = []
-    for signal in signals:
-      outputname.append("%s_pmaskedexpnorm" % signal)
-    outputnames.append(outputname)
-    
+    if nsignals > 0:
+      outputs.append(pmaskedexpsig)
+      outputs.append(pmaskedexpnormsig)
+      
+      outputname = []
+      for signal in signals:
+        outputname.append("%s_pmaskedexp" % signal)
+      outputnames.append(outputname)
+
+      outputname = []
+      for signal in signals:
+        outputname.append("%s_pmaskedexpnorm" % signal)
+      outputnames.append(outputname)
+
+    elif nnoigroups > 0:
+      outputs.append(pmaskedexpsig)
+      outputs.append(pmaskedexpnormsig)
+
+      outputname = []
+      for idx, noi in enumerate(systs[:len(noigroupidxs)]):
+        if idx in maskednoigroupidxs:
+          outputname.append("%s_pmaskedexp" % noi)
+      outputnames.append(outputname)
+
+      outputname = []
+      for idx, noi in enumerate(systs[:len(noigroupidxs)]):
+        if idx in maskednoigroupidxs:
+          outputname.append("%s_pmaskedexpnorm" % noi)
+      outputnames.append(outputname)
+
   #charge asymmetries if defined
   if nchargegroups > 0:  
     #build matrix of cross sections
@@ -1682,17 +1724,32 @@ def fillHists(tag, witherrors=options.computeHistErrors):
     else:
       normfullval, nexpfullval, nexpsigval, nexpbkgval, nexpfullerrval, nexpsigerrval, nexpbkgerrval, normfullerrval = sess.run([normfull,nexpfull,nexpsig,nexpbkg]) + [None,None,None,None]
 
-  expfullHist = ROOT.TH1D('expfull_%s' % tag,'',nbinsfull,-0.5, float(nbinsfull)-0.5)
+  # hists for fit channels
+  expfullHist = ROOT.TH1D('expfull_%s' % tag,'',nbins,-0.5, float(nbins)-0.5)
   hists.append(expfullHist)
-  array2hist(nexpfullval,expfullHist, errors=nexpfullerrval)
+  array2hist(nexpfullval[:nbins], expfullHist, errors=nexpfullerrval[:nbins])
   
-  expsigHist = ROOT.TH1D('expsig_%s' % tag,'',nbinsfull,-0.5, float(nbinsfull)-0.5)
+  expsigHist = ROOT.TH1D('expsig_%s' % tag,'',nbins,-0.5, float(nbins)-0.5)
   hists.append(expsigHist)
-  array2hist(nexpsigval,expsigHist, errors=nexpsigerrval)
+  array2hist(nexpsigval[:nbins], expsigHist, errors=nexpsigerrval[:nbins])
   
-  expbkgHist = ROOT.TH1D('expbkg_%s' % tag,'',nbinsfull,-0.5, float(nbinsfull)-0.5)
+  expbkgHist = ROOT.TH1D('expbkg_%s' % tag,'',nbins,-0.5, float(nbins)-0.5)
   hists.append(expbkgHist)
-  array2hist(nexpbkgval,expbkgHist, errors=nexpbkgerrval)
+  array2hist(nexpbkgval[:nbins], expbkgHist, errors=nexpbkgerrval[:nbins])
+
+  if nbinsmasked > 0:
+    # hists for masked channels
+    expfullHist_masked = ROOT.TH1D('expfull_%s_masked' % tag,'',nbinsmasked,-0.5, float(nbinsmasked)-0.5)
+    hists.append(expfullHist_masked)
+    array2hist(nexpfullval[nbins:], expfullHist_masked, errors=nexpfullerrval[nbins:])
+    
+    expsigHist_masked = ROOT.TH1D('expsig_%s_masked' % tag,'',nbinsmasked,-0.5, float(nbinsmasked)-0.5)
+    hists.append(expsigHist_masked)
+    array2hist(nexpsigval[nbins:], expsigHist_masked, errors=nexpsigerrval[nbins:])
+    
+    expbkgHist_masked = ROOT.TH1D('expbkg_%s_masked' % tag,'',nbinsmasked,-0.5, float(nbinsmasked)-0.5)
+    hists.append(expbkgHist_masked)
+    array2hist(nexpbkgval[nbins:], expbkgHist_masked, errors=nexpbkgerrval[nbins:])
 
   if tag=="postfit" and options.doJacobian:
       nexpfulljacval = sess.run(nexpfulljac)
@@ -1705,14 +1762,20 @@ def fillHists(tag, witherrors=options.computeHistErrors):
 
   
   for iproc,proc in enumerate(procs):
-    expHist = ROOT.TH1D('expproc_%s_%s' % (proc,tag),'',nbinsfull,-0.5, float(nbinsfull)-0.5)
+    expHist = ROOT.TH1D('expproc_%s_%s' % (proc,tag),'',nbins,-0.5, float(nbins)-0.5)
     hists.append(expHist)
     normprocval = normfullval[:,iproc]
     normprocerrval = None
     if witherrors:
       normprocerrval = normfullerrval[:,iproc]
-    array2hist(normprocval, expHist,errors=normprocerrval)
-  
+    array2hist(normprocval[:nbins], expHist,errors=normprocerrval[:nbins])
+
+    # add masked histograms for single processes only if they have anything in the masked channel
+    if nbinsmasked > 0 and normprocval[nbins:].sum() > 0:
+      expHist_masked = ROOT.TH1D('expproc_%s_%s_masked' % (proc,tag),'',nbinsmasked,-0.5, float(nbinsmasked)-0.5)
+      hists.append(expHist_masked)
+      array2hist(normprocval[nbins:], expHist_masked, errors=normprocerrval[nbins:])
+
   #additional set of postfit histograms taking central value without bin-by-bin uncertainties, but including them in the uncertainties
   if tag=='postfit' and options.binByBinStat:
     tag = 'postfit_hybrid'
@@ -2148,7 +2211,7 @@ for itoy in range(ntoys):
   tdnllval[0] = dnllval
   tscanidx[0] = -1
   tndof[0] = x.shape[0]
-  tndofpartial[0] = npoi
+  tndofpartial[0] = npoi + nsystnoconstraint
   ttaureg[0] = taureg
 
   for output,outputname, outvals,outsigmas,minosups,minosdowns,outgenvals,toutvals,touterrs,toutminosups,toutminosdowns,toutgenvals in zip(
